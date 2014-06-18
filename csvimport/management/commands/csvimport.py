@@ -11,7 +11,6 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import LabelCommand, BaseCommand
 from optparse import make_option
 from django.db import models
-from django.contrib.contenttypes.models import ContentType
 
 from django.conf import settings
 CSVIMPORT_LOG = getattr(settings, 'CSVIMPORT_LOG', 'screen')
@@ -37,7 +36,7 @@ def save_csvimport(props=None, instance=None):
             csvimp = CSVImport()
         if props:
             for key, value in props.items():
-                setattr(csvimp, key, value)
+                csvimp.__setattr__(key, value)
         csvimp.save()
         return csvimp.id
     except:
@@ -83,8 +82,8 @@ class Command(LabelCommand):
         self.defaults = []
         self.app_label = ''
         self.model = ''
-        self.fieldmap = {}
         self.file_name = ''
+        self.delimiter = ','
         self.nameindexes = False
         self.deduplicate = True
         self.csvfile = []
@@ -97,7 +96,7 @@ class Command(LabelCommand):
         filename = label
         mappings = options.get('mappings', [])
         modelname = options.get('model', 'Item')
-        charset = options.get('charset', '')
+        charset = options.get('charset','')
         # show_traceback = options.get('traceback', True)
         self.setup(mappings, modelname, charset, filename)
         if not hasattr(self.model, '_meta'):
@@ -114,22 +113,16 @@ class Command(LabelCommand):
         return
 
     def setup(self, mappings, modelname, charset, csvfile='', defaults='',
-              uploaded=None, nameindexes=False, deduplicate=True):
+              uploaded=None, nameindexes=False, deduplicate=True, **options):
         """ Setup up the attributes for running the import """
+        self.delimiter = options.get('delimiter', self.delimiter)
         self.defaults = self.__mappings(defaults)
         if modelname.find('.') > -1:
             app_label, model = modelname.split('.')
         self.charset = charset
         self.app_label = app_label
         self.model = models.get_model(app_label, model)
-        for field in self.model._meta.fields:
-            self.fieldmap[field.name] = field
-            if field.__class__ == models.ForeignKey:
-                self.fieldmap[field.name+"_id"] = field
         if mappings:
-            # Test for column=name or just name list format
-            if mappings.find('=') == -1:
-                mappings = self.parse_header(mappings.split(','))
             self.mappings = self.__mappings(mappings)
         self.nameindexes = bool(nameindexes)
         self.file_name = csvfile
@@ -166,9 +159,10 @@ class Command(LabelCommand):
         if not getattr(self, 'csvfile', []):
             raise Exception('File %s not found' % csvfile)
 
-    def run(self, logid=0):
+    def run(self, logid=0, **options):
         """ Run the csvimport """
         loglist = []
+        instaced_obj = options.get('instance', None)
         if self.nameindexes:
             indexes = self.csvfile.pop(0)
         counter = 0
@@ -176,12 +170,24 @@ class Command(LabelCommand):
             csvimportid = logid
         else:
             csvimportid = 0
+        mapping = []
+        fieldmap = {}
+        for field in self.model._meta.fields:
+            fieldmap[field.name] = field
+            if field.__class__ == models.ForeignKey:
+                fieldmap[field.name+"_id"] = field
 
         if self.mappings:
             loglist.append('Using manually entered mapping list')
         else:
-            mappingstr = self.parse_header(self.csvfile[0])
-            if mappingstr:
+            for i, heading in enumerate(self.csvfile[0]):
+                for key in ((heading, heading.lower(),) if heading != heading.lower() else (heading,)):
+                    if fieldmap.has_key(key):
+                        field = fieldmap[key]
+                        key = self.check_fkey(key, field)
+                        mapping.append('column%s=%s' % (i+1, key))
+            mappingstr = ','.join(mapping)
+            if mapping:
                 loglist.append('Using mapping from first row of CSV file')
                 self.mappings = self.__mappings(mappingstr)
         if not self.mappings:
@@ -200,7 +206,7 @@ class Command(LabelCommand):
 
 
             for (column, field, foreignkey) in self.mappings:
-                field_type = self.fieldmap.get(field).get_internal_type()
+		field_type = fieldmap.get(field).get_internal_type()
                 if self.nameindexes:
                     column = indexes.index(column)
                 else:
@@ -283,23 +289,23 @@ class Command(LabelCommand):
 
                 importing_csv.send(sender=model_instance,
                                     row=dict(zip(self.csvfile[:1][0], row)))
+                if instaced_obj:
+			        model_instance.import_instance = instaced_obj
                 model_instance.save()
                 imported_csv.send(sender=model_instance,
                                   row=dict(zip(self.csvfile[:1][0], row)))
 
             except DatabaseError, err:
-                try:
-                    error_number, error_message = err
-                except:
-                    error_message = err
-                    error_number = 0
+                error_number, error_message = err
+
                 # Catch duplicate key error.
                 if error_number != 1062:
+
                     loglist.append(
-                        'Database Error: %s, Number: %d' % (error_message,
-                                                            error_number))
+                        'Database Error: %s, Number:' % (error_message,
+                                                         error_number))
             except OverflowError:
-                pass
+                pass 
 
             if CSVIMPORT_LOG == 'logger':
                 for line in loglist:
@@ -307,28 +313,14 @@ class Command(LabelCommand):
             self.loglist.extend(loglist)
             loglist = []
         if self.loglist:
-            self.props = {'file_name':self.file_name,
-                          'import_user':'cron',
-                          'upload_method':'cronjob',
-                          'error_log':'\n'.join(loglist),
-                          'import_date':datetime.now()}
+            self.props = { 'file_name':self.file_name,
+                           'import_user':'cron',
+                           'upload_method':'cronjob',
+                           'error_log':'\n'.join(loglist),
+                           'import_date':datetime.now()}
             return self.loglist
         else:
             return ['No logging', ]
-
-    def parse_header(self, headlist):
-        """ Parse the list of headings and match with self.fieldmap """
-        mapping = []
-        for i, heading in enumerate(headlist):
-            for key in ((heading, heading.lower(),
-                         ) if heading != heading.lower() else (heading,)):
-                if self.fieldmap.has_key(key):
-                    field = self.fieldmap[key]
-                    key = self.check_fkey(key, field)
-                    mapping.append('column%s=%s' % (i+1, key))
-        if mapping:
-            return ','.join(mapping)
-        return ''
 
     def insert_fkey(self, foreignkey, rowcol):
         """ Add fkey if not present
@@ -338,11 +330,7 @@ class Command(LabelCommand):
         """
         fk_key, fk_field = foreignkey
         if fk_key and fk_field:
-            try:
-                new_app_label = ContentType.objects.get(model=fk_key).app_label
-            except:
-                new_app_label = self.app_label
-            fk_model = models.get_model(new_app_label, fk_key)
+            fk_model = models.get_model(self.app_label, fk_key)
             matches = fk_model.objects.filter(**{fk_field+'__exact':
                                                  rowcol})
 
@@ -369,7 +357,7 @@ class Command(LabelCommand):
         self.errors.append((message, type))
 
         if type == 0:
-            # There is nothing to do. We have to quit at this point
+            # There is nothing to do. We have to quite at this point
             raise types[0][1], message
         elif self.debug == True:
             print "%s: %s" % (types[type][0], message)
@@ -394,7 +382,7 @@ class Command(LabelCommand):
     def charset_csv_reader(self, csv_data, dialect=csv.excel,
                            charset='utf-8', **kwargs):
         csv_reader = csv.reader(self.charset_encoder(csv_data, charset),
-                                dialect=dialect, **kwargs)
+                                dialect=dialect, delimiter=self.delimiter, **kwargs)
         for row in csv_reader:
             # decode charset back to Unicode, cell by cell:
             yield [unicode(cell, charset) for cell in row]
@@ -429,7 +417,7 @@ class Command(LabelCommand):
                 mappings[mapp][2] = parse_foreignkey(mapping[2])
                 mappings[mapp] = tuple(mappings[mapp])
             mappings = list(mappings)
-            
+
             return mappings
 
         def parse_foreignkey(key):
@@ -465,4 +453,6 @@ class FatalError(Exception):
 
     def __str__(self):
         return repr(self.value)
+
+
 
